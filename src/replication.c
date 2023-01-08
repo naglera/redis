@@ -1437,11 +1437,12 @@ void rdbPipeWriteHandler(struct connection *conn) {
     {
         if (connGetState(conn) == CONN_STATE_CONNECTED)
             return; /* equivalent to EAGAIN */
-        serverLog(LL_WARNING,"Write error sending DB to replica: %s",
+        serverLog(LL_WARNING,"rdbPipeWriteHandler: Write error sending DB to replica: %s",
             connGetLastError(conn));
         freeClient(slave);
         return;
     } else {
+        serverLog(LL_NOTICE,"--------------------------------------------------------------------------Master write nwritten=%ld",nwritten);
         slave->repldboff += nwritten;
         atomicIncr(server.stat_net_repl_output_bytes, nwritten);
         if (slave->repldboff < server.rdb_pipe_bufflen) {
@@ -1458,12 +1459,13 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
     UNUSED(clientData);
     UNUSED(eventLoop);
     int i;
+    char *child_says_hey = zmalloc(PROTO_IOBUF_LEN);
     if (!server.rdb_pipe_buff)
         server.rdb_pipe_buff = zmalloc(PROTO_IOBUF_LEN);
     serverAssert(server.rdb_pipe_numconns_writing==0);
 
     while (1) {
-        server.rdb_pipe_bufflen = read(fd, server.rdb_pipe_buff, PROTO_IOBUF_LEN);
+        server.rdb_pipe_bufflen = read(fd, child_says_hey, PROTO_IOBUF_LEN);
         if (server.rdb_pipe_bufflen < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return;
@@ -1501,6 +1503,20 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
         }
 
         int stillAlive = 0;
+        /* inject rdb bulk header to buffer */
+        /* 
+           1. create new buffer
+           2. put 'R' header in new buffer
+           3. put server.rdb_pipe_bufflen in new buffer
+           4. copy server.rdb_pipe_buff into new buffer
+           5. send the new buffer
+        */
+
+        memcpy(server.rdb_pipe_buff,"R",sizeof(char));
+        memcpy(server.rdb_pipe_buff+sizeof(char),&server.rdb_pipe_bufflen,sizeof(size_t));
+        memcpy(server.rdb_pipe_buff+sizeof(char)+sizeof(size_t),child_says_hey,server.rdb_pipe_bufflen);
+        server.rdb_pipe_bufflen += sizeof(char) + sizeof(long);
+
         for (i=0; i < server.rdb_pipe_numconns; i++)
         {
             ssize_t nwritten;
@@ -1520,6 +1536,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
                 /* An error and still in connected state, is equivalent to EAGAIN */
                 slave->repldboff = 0;
             } else {
+                serverLog(LL_NOTICE,"--------------------------------------------------------------------------Master write nwritten=%ld",nwritten);
                 /* Note: when use diskless replication, 'repldboff' is the offset
                  * of 'rdb_pipe_buff' sent rather than the offset of entire RDB. */
                 slave->repldboff = nwritten;
@@ -1811,10 +1828,49 @@ void replicationAttachToNewMaster() {
     freeReplicationBacklog(); /* Don't allow our chained replicas to PSYNC. */
 }
 
+size_t unWrapFullSyncPacket(char* dirtybuf, char* clean_buf, size_t nread){
+    char* ptr = dirtybuf;
+    size_t clean_bufpos = 0;
+                                                serverLog(LL_NOTICE,"[amitnagl] Start unWrapFullSyncPacket");
+    while (nread > 0){
+        if (server.repl_current_streamlen == 0){
+            /* First char is a header */
+            serverAssert(ptr[0] == 'R' || ptr[0] == 'O');
+            server.repl_is_rdb_stream = (ptr[0] == 'R');
+            ptr += sizeof(char);
+                                                serverLog(LL_NOTICE,"[amitnagl] before string2l repl_is_rdb_stream=%d",server.repl_is_rdb_stream);
+            if (!memcpy(&server.repl_current_streamlen,ptr,sizeof(size_t))){
+                serverLog(LL_WARNING,"unWrapFullSyncPacket: Couldn't create long from string");
+                return -1;
+            }
+                                                serverLog(LL_NOTICE,"[amitnagl] after string to size_t the bulk size is %ld",server.repl_current_streamlen);
+            ptr += sizeof(size_t);
+            nread -= sizeof(char) + sizeof(long);
+        }
+        size_t bytes_to_copy = min(server.repl_current_streamlen,nread);
+        if (server.repl_is_rdb_stream){
+            memcpy(clean_buf + clean_bufpos, ptr, bytes_to_copy);
+                                                // serverLog(LL_NOTICE,"[amitnagl] clean_buf = %s",clean_buf);
+            clean_bufpos += bytes_to_copy;
+        } else {
+            memcpy(server.fullsync_querybuf + server.fullsync_querybuflen, ptr, bytes_to_copy);
+                                                // serverLog(LL_NOTICE,"[amitnagl] querybuf = %s",server.fullsync_querybuf);
+            server.fullsync_querybuflen += bytes_to_copy;
+        }
+        ptr += bytes_to_copy;
+        nread -= bytes_to_copy;
+        server.repl_current_streamlen -= bytes_to_copy;
+                                                serverLog(LL_NOTICE,"[amitnagl] EOL bytes_to_copy = %ld nread = %ld, server.repl_current_streamlen = %ld",bytes_to_copy,nread,server.repl_current_streamlen);
+    }    
+        
+    return clean_bufpos;
+}
+
 /* Asynchronously read the SYNC payload we receive from a master */
 #define REPL_MAX_WRITTEN_BEFORE_FSYNC (1024*1024*8) /* 8 MB */
 void readSyncBulkPayload(connection *conn) {
     char buf[PROTO_IOBUF_LEN];
+    char dirty_buf[PROTO_IOBUF_LEN];
     ssize_t nread, readlen, nwritten;
     int use_diskless_load = useDisklessLoad();
     redisDb *diskless_load_tempDb = NULL;
@@ -1832,7 +1888,20 @@ void readSyncBulkPayload(connection *conn) {
     /* If repl_transfer_size == -1 we still have to read the bulk length
      * from the master reply. */
     if (server.repl_transfer_size == -1) {
-        nread = connSyncReadLine(conn,buf,1024,server.repl_syncio_timeout*1000);
+        nread = connSyncReadLine(conn,dirty_buf,1024,server.repl_syncio_timeout*1000);
+        serverLog(LL_NOTICE,"1--------------------------------------------------------------------------Replica got nread=%ld",nread);
+
+        static int should_init = 1;
+        if (should_init){
+            serverLog(LL_NOTICE,"Replica init fields ");
+            should_init = 0;
+            /* init master temp querybuf*/
+            server.fullsync_querybuf = zmalloc(1648);
+            server.fullsync_querybuflen = 0;
+            /* init stream type tracker */
+            server.repl_current_streamlen = 0;
+            server.repl_is_rdb_stream = true;
+        }
         if (nread == -1) {
             serverLog(LL_WARNING,
                 "I/O error reading bulk count from MASTER: %s",
@@ -1842,6 +1911,7 @@ void readSyncBulkPayload(connection *conn) {
             /* nread here is returned by connSyncReadLine(), which calls syncReadLine() and
              * convert "\r\n" to '\0' so 1 byte is lost. */
             atomicIncr(server.stat_net_repl_input_bytes, nread+1);
+            nread = unWrapFullSyncPacket(dirty_buf,buf,nread);
         }
 
         if (buf[0] == '-') {
@@ -1901,7 +1971,8 @@ void readSyncBulkPayload(connection *conn) {
             readlen = (left < (signed)sizeof(buf)) ? left : (signed)sizeof(buf);
         }
 
-        nread = connRead(conn,buf,readlen);
+        nread = connRead(conn,dirty_buf,readlen);
+        serverLog(LL_NOTICE,"2--------------------------------------------------------------------------Replica got nread=%ld",nread);
         if (nread <= 0) {
             if (connGetState(conn) == CONN_STATE_CONNECTED) {
                 /* equivalent to EAGAIN */
@@ -1913,6 +1984,7 @@ void readSyncBulkPayload(connection *conn) {
             return;
         }
         atomicIncr(server.stat_net_repl_input_bytes, nread);
+        nread = unWrapFullSyncPacket(dirty_buf,buf,nread);
 
         /* When a mark is used, we want to detect EOF asap in order to avoid
          * writing the EOF mark into the file... */
@@ -2208,6 +2280,9 @@ void readSyncBulkPayload(connection *conn) {
 
     /* Final setup of the connected slave <- master link */
     replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
+    serverLog(LL_NOTICE,"[amitnagl] coping accomulated buffer to master querybuf");
+    memcpy(server.master->querybuf, server.fullsync_querybuf,server.fullsync_querybuflen);
+
     server.repl_state = REPL_STATE_CONNECTED;
     server.repl_down_since = 0;
 

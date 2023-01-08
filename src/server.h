@@ -1815,6 +1815,11 @@ struct redisServer {
                                      * when it receives an error on the replication stream */
     int repl_ignore_disk_write_error;   /* Configures whether replicas panic when unable to
                                          * persist writes to AOF. */
+    bool repl_is_rdb_stream;
+    size_t repl_current_streamlen;
+    
+    char* fullsync_querybuf;
+    size_t fullsync_querybuflen;
     /* The following two fields is where we store master PSYNC replid/offset
      * while the PSYNC is in progress. At the end we'll copy the fields into
      * the server->master client structure. */
