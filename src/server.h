@@ -1817,6 +1817,8 @@ struct redisServer {
                                          * persist writes to AOF. */
     bool repl_is_rdb_stream;
     size_t repl_current_streamlen;
+    char size_of_packet[sizeof(size_t)];
+    int size_of_packetpos;
     
     char* fullsync_querybuf;
     size_t fullsync_querybuflen;

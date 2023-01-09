@@ -2042,6 +2042,16 @@ void initServerConfig(void) {
 
     /* Debugging */
     server.watchdog_period = 0;
+
+    serverLog(LL_NOTICE,"init mpx fields ");
+    /* init master temp querybuf*/
+    server.fullsync_querybuf = zmalloc(1648);
+    server.fullsync_querybuflen = 0;
+    /* init stream type tracker */
+    server.repl_current_streamlen = 0;
+    server.repl_is_rdb_stream = true;
+    memset(server.size_of_packet,0x00,sizeof(size_t));
+    server.size_of_packetpos = -1;
 }
 
 extern char **environ;

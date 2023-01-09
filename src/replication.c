@@ -1426,6 +1426,95 @@ void rdbPipeWriteHandlerConnRemoved(struct connection *conn) {
     }
 }
 
+size_t feedRdbBufferFromReplicationBuffer(client* slave) {
+    /* 1. Find out what replication data replica needs
+     *  a. verify primary has backlog buffer
+     *  b. verify the buffer has active nodes
+     *  c. if slave doesnt know from which place to read place it on the first node
+     *  d. read from the node till max or limit
+     * 2. Copy replication data to the end of server.rdb_pipe_buff
+     *  a. wrap data
+     *  b. copy it to server.rdb_pipe_buff
+     */
+    // static long long repl_block_id = 0;
+
+    if (server.repl_backlog == NULL) return 0;
+    // server.master_repl_offset += len;
+    // server.repl_backlog->histlen += len;
+
+    size_t start_pos = 0; /* The position of referenced block to start sending. */
+    listNode *start_node = NULL; /* Replica/backlog starts referenced node. */
+    // int add_new_block = 0; /* Create new block if current block is total used. */
+    listNode *ln = listLast(server.repl_buffer_blocks);
+    replBufBlock *tail = ln ? listNodeValue(ln) : NULL;
+
+    if (!tail)
+        return 0;
+    
+    start_node = listLast(server.repl_buffer_blocks);
+    start_pos = tail->used;
+
+
+    /* For output buffer of replicas. */
+    // listIter li;
+    // listRewind(server.slaves,&li);
+    // while((ln = listNext(&li))) {
+    //     client *slave = ln->value;
+    //     if (!canFeedReplicaReplBuffer(slave)) continue;
+
+        /* Update shared replication buffer start position. */
+    if (slave->ref_repl_buf_node == NULL) {
+        slave->ref_repl_buf_node = start_node;
+        slave->ref_block_pos = start_pos;
+        /* Only increase the start block reference count. */
+        ((replBufBlock *)listNodeValue(start_node))->refcount++;
+    }
+
+    
+    replBufBlock *o = listNodeValue(slave->ref_repl_buf_node);
+    serverAssert(o->used >= slave->ref_block_pos);
+    /* Send current block if it is not fully sent. */
+    // size_t size_of_buffer_with_rdb_only = server.rdb_pipe_bufflen;
+    size_t repl_block_size = 0;
+
+    int header_size = sizeof(char)+sizeof(size_t);
+    if (o->used > slave->ref_block_pos) {
+        /* Wrap packet with [ O | size_t | message ] */
+        char *repl_stream = zmalloc(PROTO_IOBUF_LEN);
+        repl_block_size = min(o->used-slave->ref_block_pos,300);
+        memcpy(repl_stream,"O",sizeof(char));
+        memcpy(repl_stream+sizeof(char),&repl_block_size,sizeof(size_t));
+        memcpy(repl_stream+header_size,
+                o->buf+slave->ref_block_pos,
+                repl_block_size);
+        repl_block_size += header_size;
+        
+        memcpy(server.rdb_pipe_buff + server.rdb_pipe_bufflen, repl_stream, repl_block_size);
+        server.rdb_pipe_bufflen += repl_block_size;
+    }
+
+    // /* For replication backlog */
+    // if (server.repl_backlog->ref_repl_buf_node == NULL) {
+    //     server.repl_backlog->ref_repl_buf_node = start_node;
+    //     /* Only increase the start block reference count. */
+    //     ((replBufBlock *)listNodeValue(start_node))->refcount++;
+
+    //     /* Replication buffer must be empty before adding replication stream
+    //      * into replication backlog. */
+    //     serverAssert(add_new_block == 1 && start_pos == 0);
+    // }
+    // if (add_new_block) {
+    //     createReplicationBacklogIndex(listLast(server.repl_buffer_blocks));
+    // }
+    /* Try to trim replication backlog since replication backlog may exceed
+     * our setting when we add replication stream. Note that it is important to
+     * try to trim at least one node since in the common case this is where one
+     * new backlog node is added and one should be removed. See also comments
+     * in freeMemoryGetNotCountedMemory for details. */
+    incrementalTrimReplicationBacklog(REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
+    return repl_block_size;
+}
+
 /* Called in diskless master during transfer of data from the rdb pipe, when
  * the replica becomes writable again. */
 void rdbPipeWriteHandler(struct connection *conn) {
@@ -1503,19 +1592,26 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
         }
 
         int stillAlive = 0;
-        /* inject rdb bulk header to buffer */
-        /* 
-           1. create new buffer
-           2. put 'R' header in new buffer
-           3. put server.rdb_pipe_bufflen in new buffer
-           4. copy server.rdb_pipe_buff into new buffer
-           5. send the new buffer
-        */
 
+        /*****************************************************************************/
+        /* wrap rdb bulk header to buffer */
+        size_t block_size = 0;
+        block_size = server.rdb_pipe_bufflen - 1;
+        memset(server.rdb_pipe_buff,'\0',sizeof(char)+sizeof(size_t)+1);
         memcpy(server.rdb_pipe_buff,"R",sizeof(char));
-        memcpy(server.rdb_pipe_buff+sizeof(char),&server.rdb_pipe_bufflen,sizeof(size_t));
+        memcpy(server.rdb_pipe_buff+sizeof(char),&block_size,sizeof(size_t));
+        // serverLog(LL_DEBUG,"Bulk size is %ld, ", block_size);
         memcpy(server.rdb_pipe_buff+sizeof(char)+sizeof(size_t),child_says_hey,server.rdb_pipe_bufflen);
         server.rdb_pipe_bufflen += sizeof(char) + sizeof(long);
+            static int should_inc = 0;
+            if (should_inc){
+                serverLog(LL_DEBUG,"Block number %d Data: %*.*s",should_inc, sizeof(size_t), sizeof(size_t), server.rdb_pipe_buff+sizeof(char)); 
+                should_inc++;
+            } else{
+                serverLog(LL_DEBUG,"1Block number %d Data: %*.*s",should_inc, sizeof(size_t), sizeof(size_t), server.rdb_pipe_buff+sizeof(char));  
+                should_inc++;
+            }
+        /*****************************************************************************/
 
         for (i=0; i < server.rdb_pipe_numconns; i++)
         {
@@ -1525,6 +1621,14 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
                 continue;
 
             client *slave = connGetPrivateData(conn);
+            /*****************************************************************************/
+            /* Before writing to slave we want to share one packet of replication stream */
+            size_t size_of_buffer_with_rdb_only = server.rdb_pipe_bufflen;
+            size_t header_size = sizeof(char) + sizeof(size_t);
+            size_t repl_block_size = feedRdbBufferFromReplicationBuffer(slave);
+
+            /*****************************************************************************/
+
             if ((nwritten = connWrite(conn, server.rdb_pipe_buff, server.rdb_pipe_bufflen)) == -1) {
                 if (connGetState(conn) != CONN_STATE_CONNECTED) {
                     serverLog(LL_WARNING,"Diskless rdb transfer, write error sending DB to replica: %s",
@@ -1536,7 +1640,26 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
                 /* An error and still in connected state, is equivalent to EAGAIN */
                 slave->repldboff = 0;
             } else {
-                serverLog(LL_NOTICE,"--------------------------------------------------------------------------Master write nwritten=%ld",nwritten);
+                /*****************************************************************************/    
+                /* Calculate how much replication data we were able to send in the current write */
+                size_t nwritten_repl_stream = max(0, ((long)nwritten - (long)size_of_buffer_with_rdb_only));         
+                if(nwritten_repl_stream && slave->ref_repl_buf_node){
+                    slave->ref_block_pos += repl_block_size - header_size;
+                    /* If we fully sent the object on head, go to the next one. */
+                    replBufBlock *o = listNodeValue(slave->ref_repl_buf_node);
+                    listNode *next = listNextNode(slave->ref_repl_buf_node);
+                    if (next && slave->ref_block_pos == o->used) {
+                        o->refcount--;
+                        ((replBufBlock *)(listNodeValue(next)))->refcount++;
+                        slave->ref_repl_buf_node = next;
+                        slave->ref_block_pos = 0;
+                        // incrementalTrimReplicationBacklog(REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
+                    }
+                }
+                // serverLog(LL_DEBUG,"slave offsets end %p : %ld",(void*)slave->ref_repl_buf_node,slave->ref_block_pos);
+                serverLog(LL_DEBUG,"-----------------------------Master write nwritten=%ld | rdb: %ld | repl: %ld",nwritten,size_of_buffer_with_rdb_only,nwritten_repl_stream);
+
+                /*****************************************************************************/
                 /* Note: when use diskless replication, 'repldboff' is the offset
                  * of 'rdb_pipe_buff' sent rather than the offset of entire RDB. */
                 slave->repldboff = nwritten;
@@ -1550,6 +1673,20 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
                 connSetWriteHandler(conn, rdbPipeWriteHandler);
             }
             stillAlive++;
+
+            // char* fake_set = "*3\r\n$3\r\nset\r\n$4\r\nfake\r\n$3\r\nval\r\n";
+            // size_t fake_setlen = strlen(fake_set);
+            // char* fake_msg = zmalloc(PROTO_IOBUF_LEN);
+            // memcpy(fake_msg,"O",sizeof(char));
+            // memcpy(fake_msg+sizeof(char),&fake_setlen,sizeof(size_t));
+            // memcpy(fake_msg+sizeof(char)+sizeof(size_t),fake_set,fake_setlen);
+            // size_t fake_msglen = sizeof(char) + sizeof(size_t) + fake_setlen;
+            // serverLog(LL_NOTICE,"Fake Stream \nfake_set\n%s\nfake_setlen:%ld\nfake_msg\n%s\nfake_msglen:%ld",fake_set,fake_setlen,fake_msg,fake_msglen);
+            // if ((nwritten = connWrite(conn, fake_msg, fake_msglen)) == -1) {
+            //     serverLog(LL_NOTICE,"--------------------------------------------------------------------------Replication Stream Master FAILD nwritten=%ld",nwritten);
+            // }
+            // serverLog(LL_NOTICE,"--------------------------------------------------------------------------Replication Strea Master write nwritten=%ld",nwritten);
+            
         }
 
         if (stillAlive == 0) {
@@ -1831,23 +1968,82 @@ void replicationAttachToNewMaster() {
 size_t unWrapFullSyncPacket(char* dirtybuf, char* clean_buf, size_t nread){
     char* ptr = dirtybuf;
     size_t clean_bufpos = 0;
-                                                serverLog(LL_NOTICE,"[amitnagl] Start unWrapFullSyncPacket");
+    static int should_inc = 0;
+                                                serverLog(LL_DEBUG,"[amitnagl] Start unWrapFullSyncPacket");
+
+    if(server.size_of_packetpos != -1){
+                                                serverLog(LL_DEBUG,"[amitnagl] ************************ server.size_of_packetpos != -1 ... = %d ",server.size_of_packetpos);
+        int bytes_missed = min(nread, sizeof(size_t)-server.size_of_packetpos);
+        if (!memcpy(server.size_of_packet + server.size_of_packetpos,ptr,bytes_missed)){
+            serverLog(LL_WARNING,"unWrapFullSyncPacket: Couldn't create long from string A");
+            return -1;
+        }
+        ptr += bytes_missed;
+        nread -= bytes_missed;
+        server.size_of_packetpos += bytes_missed;
+                                                serverLog(LL_DEBUG,"[amitnagl] ************************ nread was small, now size_of_packetpos = %d , bytes_missed=%d, nread=%d",server.size_of_packetpos,bytes_missed,nread);
+        serverAssert(server.size_of_packetpos == sizeof(size_t));
+
+        if (!memcpy(&server.repl_current_streamlen,server.size_of_packet,sizeof(size_t))){
+            serverLog(LL_WARNING,"unWrapFullSyncPacket: Couldn't create long from string");
+            return -1;
+        }
+        if (should_inc){
+            if(server.repl_is_rdb_stream)
+                server.repl_current_streamlen++;
+            serverLog(LL_DEBUG,"Block number %d Data: %*.*s",should_inc, sizeof(size_t), sizeof(size_t), ptr); 
+            
+            should_inc++;
+        }                                                serverLog(LL_DEBUG,"[amitnagl] ************************ new size is %d",server.repl_current_streamlen);
+        memset(server.size_of_packet,'\0',sizeof(size_t));
+        server.size_of_packetpos = -1;
+    
+
+    }
     while (nread > 0){
         if (server.repl_current_streamlen == 0){
             /* First char is a header */
+                                                serverLog(LL_DEBUG,"[amitnagl]------------------------Harryy new block");
             serverAssert(ptr[0] == 'R' || ptr[0] == 'O');
             server.repl_is_rdb_stream = (ptr[0] == 'R');
             ptr += sizeof(char);
-                                                serverLog(LL_NOTICE,"[amitnagl] before string2l repl_is_rdb_stream=%d",server.repl_is_rdb_stream);
+            nread -= sizeof(char);
+
+            if(nread < sizeof(size_t)){
+                // reading the size of the packet
+                                                serverLog(LL_DEBUG,"[amitnagl] ************************ nread is small, %d ",nread);
+                server.size_of_packetpos = 0;
+                if (!memcpy(&server.size_of_packet,ptr,nread)){
+                    serverLog(LL_WARNING,"unWrapFullSyncPacket: Couldn't create long from string");
+                    return -1;
+                }
+                server.size_of_packetpos += nread;
+                                                serverLog(LL_DEBUG,"[amitnagl] ************************ nread is small, %d , server.size_of_packetpos=%d",nread,server.size_of_packetpos);
+                serverAssert(server.size_of_packetpos <= sizeof(size_t));
+                return 0;
+            } 
+            
+                                            serverLog(LL_DEBUG,"[amitnagl] before string2l repl_is_rdb_stream=%d",server.repl_is_rdb_stream);
             if (!memcpy(&server.repl_current_streamlen,ptr,sizeof(size_t))){
                 serverLog(LL_WARNING,"unWrapFullSyncPacket: Couldn't create long from string");
                 return -1;
             }
-                                                serverLog(LL_NOTICE,"[amitnagl] after string to size_t the bulk size is %ld",server.repl_current_streamlen);
+            
+            if (should_inc){
+                if(server.repl_is_rdb_stream)
+                    server.repl_current_streamlen++;
+                serverLog(LL_DEBUG,"Block number %d Data: %*.*s",should_inc, sizeof(size_t), sizeof(size_t), ptr); 
+                
+                should_inc++;
+            } else{
+                serverLog(LL_DEBUG,"1Block number %d Data: %*.*s",should_inc, sizeof(size_t), sizeof(size_t), ptr); 
+                should_inc++;
+            }
+                                                serverLog(LL_DEBUG,"[amitnagl] after string to size_t the bulk size is %ld",server.repl_current_streamlen);
             ptr += sizeof(size_t);
-            nread -= sizeof(char) + sizeof(long);
+            nread -= sizeof(size_t);
         }
-        size_t bytes_to_copy = min(server.repl_current_streamlen,nread);
+        size_t bytes_to_copy = max(min(server.repl_current_streamlen,nread),0);
         if (server.repl_is_rdb_stream){
             memcpy(clean_buf + clean_bufpos, ptr, bytes_to_copy);
                                                 // serverLog(LL_NOTICE,"[amitnagl] clean_buf = %s",clean_buf);
@@ -1860,7 +2056,7 @@ size_t unWrapFullSyncPacket(char* dirtybuf, char* clean_buf, size_t nread){
         ptr += bytes_to_copy;
         nread -= bytes_to_copy;
         server.repl_current_streamlen -= bytes_to_copy;
-                                                serverLog(LL_NOTICE,"[amitnagl] EOL bytes_to_copy = %ld nread = %ld, server.repl_current_streamlen = %ld",bytes_to_copy,nread,server.repl_current_streamlen);
+                                                serverLog(LL_DEBUG,"[amitnagl] EOL bytes_to_copy = %ld nread = %ld, server.repl_current_streamlen = %ld",bytes_to_copy,nread,server.repl_current_streamlen);
     }    
         
     return clean_bufpos;
@@ -1887,21 +2083,15 @@ void readSyncBulkPayload(connection *conn) {
 
     /* If repl_transfer_size == -1 we still have to read the bulk length
      * from the master reply. */
+    memset(dirty_buf,'\0',11);
     if (server.repl_transfer_size == -1) {
         nread = connSyncReadLine(conn,dirty_buf,1024,server.repl_syncio_timeout*1000);
-        serverLog(LL_NOTICE,"1--------------------------------------------------------------------------Replica got nread=%ld",nread);
+        serverLog(LL_DEBUG,"1--------------------------------------------------------------------------Replica got nread=%ld",nread);
 
-        static int should_init = 1;
-        if (should_init){
-            serverLog(LL_NOTICE,"Replica init fields ");
-            should_init = 0;
-            /* init master temp querybuf*/
-            server.fullsync_querybuf = zmalloc(1648);
-            server.fullsync_querybuflen = 0;
-            /* init stream type tracker */
-            server.repl_current_streamlen = 0;
-            server.repl_is_rdb_stream = true;
-        }
+        // static int should_init = 1;
+        // if (should_init){
+            
+        // }
         if (nread == -1) {
             serverLog(LL_WARNING,
                 "I/O error reading bulk count from MASTER: %s",
@@ -1972,7 +2162,7 @@ void readSyncBulkPayload(connection *conn) {
         }
 
         nread = connRead(conn,dirty_buf,readlen);
-        serverLog(LL_NOTICE,"2--------------------------------------------------------------------------Replica got nread=%ld",nread);
+        serverLog(LL_DEBUG,"2--------------------------------------------------------------------------Replica got nread=%ld",nread);
         if (nread <= 0) {
             if (connGetState(conn) == CONN_STATE_CONNECTED) {
                 /* equivalent to EAGAIN */
@@ -2051,7 +2241,10 @@ void readSyncBulkPayload(connection *conn) {
 
         /* If the transfer is yet not complete, we need to read more, so
          * return ASAP and wait for the handler to be called again. */
-        if (!eof_reached) return;
+        if (!eof_reached) {
+            serverLog(LL_DEBUG,"!eof_reached=1 return");
+            return;
+        }
     }
 
     /* We reach this point in one of the following cases:
@@ -2280,8 +2473,10 @@ void readSyncBulkPayload(connection *conn) {
 
     /* Final setup of the connected slave <- master link */
     replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
-    serverLog(LL_NOTICE,"[amitnagl] coping accomulated buffer to master querybuf");
+    serverLog(LL_NOTICE,"[MPX Replication Stream With RDB] Coping accomulated buffer to master querybuf");
     memcpy(server.master->querybuf, server.fullsync_querybuf,server.fullsync_querybuflen);
+    sdssetlen(server.master->querybuf,server.fullsync_querybuflen);
+    processInputBuffer(server.master);
 
     server.repl_state = REPL_STATE_CONNECTED;
     server.repl_down_since = 0;
