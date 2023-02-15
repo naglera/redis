@@ -2458,6 +2458,14 @@ int processPendingCommandAndInputBuffer(client *c) {
     return C_OK;
 }
 
+int replShouldSkipCommandProccessing(client *c){
+    /* In case we are during RDB load then we would like to skip the command proccess
+    * The commands will be kept in c->querybuf untill this replica done loading the RDB */
+    return (c->flags & CLIENT_MASTER) && server.second_conn_enabled && 
+        (server.repl_state >= REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_SEND_PSYNC && 
+         server.repl_state <= REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_PSYNC_REPLY);
+}
+
 /* This function is called every time, in the client structure 'c', there is
  * more query buffer to process, because we read more data from the socket
  * or because a client was blocked and later reactivated, so there could be
@@ -2649,6 +2657,10 @@ void readQueryFromClient(connection *conn) {
         sdsfree(bytes);
         freeClientAsync(c);
         goto done;
+    }
+
+    if (replShouldSkipCommandProccessing(c)){
+        return;
     }
 
     /* There is more data in the client input buffer, continue parsing it

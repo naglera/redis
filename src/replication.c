@@ -44,10 +44,13 @@
 
 void replicationDiscardCachedMaster(void);
 void replicationResurrectCachedMaster(connection *conn);
+void replicationSteadyStateInit();
 void replicationSendAck(void);
 int replicaPutOnline(client *slave);
 void replicaStartCommandStream(client *slave);
 int cancelReplicationHandshake(int reconnect);
+void syncWithMaster(connection *conn);
+size_t processEndOffsetResponse(char* response);
 
 /* We take a global flag to remember if this instance generated an RDB
  * because of replication, so that we can remove the RDB file in case
@@ -995,6 +998,10 @@ void syncCommand(client *c) {
         if (masterTryPartialResynchronization(c, psync_offset) == C_OK) {
             server.stat_sync_partial_ok++;
             return; /* No full resync needed, return. */
+        } else if (c->flags | CLIENT_PSYNC_CONN){
+            serverLog(LL_NOTICE,"[Second Connection For RDB] Replica %s is marked as psync-only, and psync isn't possible. returning.",replicationGetSlaveName(c));
+            addReply(c,shared.emptybulk);
+            return;
         } else {
             char *master_replid = c->argv[1]->ptr;
 
@@ -1244,6 +1251,25 @@ void replconfCommand(client *c) {
                 }
             }
             sdsfreesplitres(filters, filter_count);
+        } else if (!strcasecmp(c->argv[j]->ptr,"end-offset")){
+            /* REPLCONF end-offset is used to identify the client wants
+            *  the snapshot end offset once snapshot is sent. */
+            long start_with_offset = 0;
+            if (getRangeLongFromObjectOrReply(c,c->argv[j+1],
+                    0,1,&start_with_offset,NULL) != C_OK)
+                return;
+            if (start_with_offset == 1) c->flags |= CLIENT_FSYNC_PSYNC_MODE;
+            else c->flags &= ~CLIENT_FSYNC_PSYNC_MODE;
+        } else if (!strcasecmp(c->argv[j]->ptr,"psync-only")){
+            /* REPLCONF psync-only is used to identify the client wants
+            *  to psync if possible. If in not possible do not auto trigger fsync.
+            *  We use it during sync with second channel to mark the main connection. */
+            long psync_only = 0;
+            if (getRangeLongFromObjectOrReply(c,c->argv[j+1],
+                    0,1,&psync_only,NULL) != C_OK)
+                return;
+            if (psync_only == 1) c->flags |= CLIENT_PSYNC_CONN;
+            else c->flags &= ~CLIENT_PSYNC_CONN;
         } else {
             addReplyErrorFormat(c,"Unrecognized REPLCONF option: %s",
                 (char*)c->argv[j]->ptr);
@@ -1804,7 +1830,13 @@ void disklessLoadDiscardTempDb(redisDb *tempDb) {
 void replicationAttachToNewMaster() { 
     /* Replica starts to apply data from new master, we must discard the cached
      * master structure. */
-    serverAssert(server.master == NULL);
+    if (server.second_conn_enabled){
+        /* When using second channel, we expect the master
+         * to be initialized and used by main connection */
+        serverAssert(server.master != NULL);
+    } else {
+        serverAssert(server.master == NULL);
+    }
     replicationDiscardCachedMaster();
 
     disconnectSlaves(); /* Force our replicas to resync with us as well. */
@@ -1833,6 +1865,7 @@ void readSyncBulkPayload(connection *conn) {
      * from the master reply. */
     if (server.repl_transfer_size == -1) {
         nread = connSyncReadLine(conn,buf,1024,server.repl_syncio_timeout*1000);
+        size_t bufpos = 0;
         if (nread == -1) {
             serverLog(LL_WARNING,
                 "I/O error reading bulk count from MASTER: %s",
@@ -1855,7 +1888,15 @@ void readSyncBulkPayload(connection *conn) {
              * timestamp. */
             server.repl_transfer_lastio = server.unixtime;
             return;
-        } else if (buf[0] != '$') {
+        } else if (server.second_conn_enabled) {
+            /* Recive end of rdb offset */
+            if (strncmp(buf, "+ENDOFFSET", 10)) {
+                serverLog(LL_NOTICE,"Server does not support rdb-only, second channel sync approach cannot be used");
+                serverAssert(0); // TODO mitigation
+            }
+            serverLog(LL_NOTICE,"Replica got +ENDOFFSET response from master, resume main connection (psync conn)");
+            bufpos += processEndOffsetResponse(buf);
+        } else if (buf[bufpos] != '$') {
             serverLog(LL_WARNING,"Bad protocol from MASTER, the first byte is not '$' (we received '%s'), are you sure the host and port are right?", buf);
             goto error;
         }
@@ -1870,9 +1911,9 @@ void readSyncBulkPayload(connection *conn) {
          * At the end of the file the announced delimiter is transmitted. The
          * delimiter is long and random enough that the probability of a
          * collision with the actual file content can be ignored. */
-        if (strncmp(buf+1,"EOF:",4) == 0 && strlen(buf+5) >= CONFIG_RUN_ID_SIZE) {
+        if (strncmp(buf+1+bufpos,"EOF:",4) == 0 && strlen(buf+5+bufpos) >= CONFIG_RUN_ID_SIZE) {
             usemark = 1;
-            memcpy(eofmark,buf+5,CONFIG_RUN_ID_SIZE);
+            memcpy(eofmark,buf+5+bufpos,CONFIG_RUN_ID_SIZE);
             memset(lastbytes,0,CONFIG_RUN_ID_SIZE);
             /* Set any repl_transfer_size to avoid entering this code path
              * at the next call. */
@@ -1882,7 +1923,7 @@ void readSyncBulkPayload(connection *conn) {
                 use_diskless_load? "to parser":"to disk");
         } else {
             usemark = 0;
-            server.repl_transfer_size = strtol(buf+1,NULL,10);
+            server.repl_transfer_size = strtol(buf+1+bufpos,NULL,10);
             serverLog(LL_NOTICE,
                 "MASTER <-> REPLICA sync: receiving %lld bytes from master %s",
                 (long long) server.repl_transfer_size,
@@ -2201,13 +2242,18 @@ void readSyncBulkPayload(connection *conn) {
         }
 
         zfree(server.repl_transfer_tmpfile);
-        close(server.repl_transfer_fd);
-        server.repl_transfer_fd = -1;
+        if (!server.second_conn_enabled) {
+            /* When syncing using second connection, repl_transfer_fd is 
+             * used for psync at this point */
+            close(server.repl_transfer_fd);
+            server.repl_transfer_fd = -1;
+        }
         server.repl_transfer_tmpfile = NULL;
     }
 
     /* Final setup of the connected slave <- master link */
-    replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
+    if (!server.second_conn_enabled)
+        replicationCreateMasterClient(server.repl_transfer_s,rsi.repl_stream_db);
     server.repl_state = REPL_STATE_CONNECTED;
     server.repl_down_since = 0;
 
@@ -2339,6 +2385,148 @@ char *sendCommandArgv(connection *conn, int argc, char **argv, size_t *argv_lens
     return NULL;
 }
 
+size_t processEndOffsetResponse(char* response){
+    size_t bufpos = 0;
+    int dbid = 0;
+    /* Copy master's db id and create a master client */
+    memcpy(&dbid, response + (bufpos += 10), sizeof(int));
+    replicationCreateMasterClient(server.repl_transfer_s, dbid);
+    /* Copy master's replication id and offset for psync */
+    memcpy(server.master->replid, response + (bufpos += sizeof(int)), CONFIG_RUN_ID_SIZE);
+    memcpy(&server.master->reploff, response + (bufpos += CONFIG_RUN_ID_SIZE+1), sizeof(long long));
+    
+    /* Init the main connection for psync */
+    server.repl_transfer_s->state = CONN_STATE_CONNECTED;
+    server.repl_state = REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_SEND_PSYNC;
+    
+    connSetReadHandler(server.master->conn, syncWithMaster);
+    syncWithMaster(server.repl_transfer_s);
+
+    return bufpos + sizeof(long long);
+}
+
+void fullSyncWithMaster(connection* conn){
+    char *err = NULL;
+    int dfd = -1;
+    serverAssert(conn == server.repl_full_sync_s);
+    
+    /* Send replcia capabilities */
+    if (server.repl_state == REPL_STATE_RECEIVE_PSYNC_REPLY){
+        serverLog(LL_NOTICE,"Recived first reply from master using second connection sending capa");
+        err = sendCommand(conn,"REPLCONF",
+                "capa","eof",NULL);
+        if (err) goto write_error;
+        server.repl_state = REPL_SEC_CONN_RECEIVE_CAPA_REPLY;
+
+        if (connSetReadHandler(conn, fullSyncWithMaster) == C_ERR) {
+            char conninfo[CONN_INFO_LEN];
+            serverLog(LL_WARNING,
+                "Can't create readable event for SYNC: %s (%s)",
+                strerror(errno), connGetInfo(conn, conninfo, sizeof(conninfo)));
+            goto error;
+        }
+        return;
+    }
+    /* Receive CAPA reply. */
+    if (server.repl_state == REPL_SEC_CONN_RECEIVE_CAPA_REPLY) {
+        serverLog(LL_NOTICE,"Recived capa response, sending rdb-only");
+        err = receiveSynchronousResponse(conn);
+        if (err == NULL) goto no_response_error;
+
+        if (err[0] == '-') {
+            serverLog(LL_NOTICE,"Server does not support CAPA, second channel sync approach cannot be used: %s", err);
+            serverAssert(0); // TODO mitigation
+        }
+        sdsfree(err);
+        err = NULL;
+        
+        /* Ask master for rdb only */
+        err = sendCommand(conn,"REPLCONF",
+            "rdb-only","1",NULL);
+        if (err) goto write_error;
+        server.repl_state = REPL_SEC_CONN_RECEIVE_RDBONLY_REPLY;
+        
+        return;
+    }
+    /* Receive RDBONLY reply. */
+    if (server.repl_state == REPL_SEC_CONN_RECEIVE_RDBONLY_REPLY) {
+        serverLog(LL_NOTICE,"Recived rdb-only response sending offset request");
+        err = receiveSynchronousResponse(conn);
+        if (err == NULL) goto no_response_error;
+
+        if (err[0] == '-') {
+            serverLog(LL_NOTICE,"Server does not support rdb-only, second channel sync approach cannot be used: %s", err);
+            serverAssert(0); // TODO mitigation
+        }
+        sdsfree(err);
+        err = NULL;
+        
+        /* Ask master for sync with offset */
+        err = sendCommand(conn,"REPLCONF",
+            "end-offset","1",NULL);
+        if (err) goto write_error;
+        server.repl_state = REPL_SEC_CONN_RECEIVE_OFFSET_REPLY;
+
+        return;
+    }
+    /* Recive offset request response */
+    if (server.repl_state == REPL_SEC_CONN_RECEIVE_OFFSET_REPLY) {
+        err = receiveSynchronousResponse(conn);
+        if (err == NULL) goto no_response_error;
+
+        if (err[0] == '-') {
+            serverLog(LL_NOTICE,"Server does not support sync with offset, second channel sync approach cannot be used: %s", err);
+            serverAssert(0); // TODO mitigation
+        }
+        sdsfree(err);
+        err = NULL;
+
+        if (connSyncWrite(conn,"SYNC\r\n",6,server.repl_syncio_timeout*1000) == -1) {
+            serverLog(LL_WARNING,"I/O error writing to MASTER: %s",
+                connGetLastError(conn));
+            goto error;
+        }
+
+        /* Set connection handler for RDB */
+        if (connSetReadHandler(conn, readSyncBulkPayload) == C_ERR) {
+            char conninfo[CONN_INFO_LEN];
+            serverLog(LL_WARNING,
+                "Can't create readable event for SYNC: %s (%s)",
+                strerror(errno), connGetInfo(conn, conninfo, sizeof(conninfo)));
+            goto error;
+        }
+
+        server.repl_state = REPL_STATE_TRANSFER;
+        server.repl_transfer_size = -1;
+        server.repl_transfer_read = 0;
+        server.repl_transfer_last_fsync_off = 0;
+        server.repl_transfer_lastio = server.unixtime;
+        return;
+    }
+
+    no_response_error: /* Handle receiveSynchronousResponse() error when master has no reply */
+        serverLog(LL_WARNING, "Master did not respond to command during SYNC handshake");
+        /* Fall through to regular error handling */
+
+    error:
+        if (dfd != -1) close(dfd);
+        connClose(conn);
+        server.repl_transfer_s = NULL;
+        if (server.repl_transfer_fd != -1)
+            close(server.repl_transfer_fd);
+        if (server.repl_transfer_tmpfile)
+            zfree(server.repl_transfer_tmpfile);
+        server.repl_transfer_tmpfile = NULL;
+        server.repl_transfer_fd = -1;
+        server.repl_state = REPL_STATE_CONNECT;
+        return;
+
+    write_error: /* Handle sendCommand() errors. */
+        serverLog(LL_WARNING,"Sending command to master in replication handshake: %s", err);
+        sdsfree(err);
+        goto error;
+}
+
 /* Try a partial resynchronization with the master if we are about to reconnect.
  * If there is no cached master structure, at least try to issue a
  * "PSYNC ? -1" command in order to trigger a full resync using the PSYNC
@@ -2411,6 +2599,10 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
             psync_replid = server.cached_master->replid;
             snprintf(psync_offset,sizeof(psync_offset),"%lld", server.cached_master->reploff+1);
             serverLog(LL_NOTICE,"Trying a partial resynchronization (request %s:%s).", psync_replid, psync_offset);
+        } if (server.second_conn_enabled && server.master) {
+            psync_replid = server.master->replid;
+            snprintf(psync_offset,sizeof(psync_offset),"%lld", server.master->reploff+1);
+            serverLog(LL_NOTICE,"Trying a partial resynchronization using main channel (request %s:%s).", psync_replid, psync_offset);
         } else {
             serverLog(LL_NOTICE,"Partial resynchronization not possible (no cached master)");
             psync_replid = "?";
@@ -2486,7 +2678,8 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
 
     if (!strncmp(reply,"+CONTINUE",9)) {
         /* Partial resync was accepted. */
-        serverLog(LL_NOTICE,
+        serverLog(LL_NOTICE, (server.repl_state == REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_SEND_PSYNC)? 
+            "Main connection psync during RDB load through second connection":
             "Successful partial resynchronization with master.");
 
         /* Check the new replication ID advertised by the master. If it
@@ -2501,8 +2694,15 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
             char new[CONFIG_RUN_ID_SIZE+1];
             memcpy(new,start,CONFIG_RUN_ID_SIZE);
             new[CONFIG_RUN_ID_SIZE] = '\0';
-
-            if (strcmp(new,server.cached_master->replid)) {
+            if (server.second_conn_enabled && server.master) {
+                /* Incase we are using second connection for RDB, the master is already initialized by now 
+                 * In this case we will just verify his id. Notice that in this case chached master is not 
+                 * relevent because it wasn't used*/
+                serverAssert(strcmp(new,server.master->replid) == 0);
+                server.master->read_reploff = server.master->reploff;
+                disconnectSlaves();
+            }
+            else if (strcmp(new,server.cached_master->replid)) {
                 /* Master ID changed. */
                 serverLog(LL_WARNING,"Master replication ID changed to %s",new);
 
@@ -2523,7 +2723,13 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
 
         /* Setup the replication to continue. */
         sdsfree(reply);
-        replicationResurrectCachedMaster(conn);
+
+        if (!(server.second_conn_enabled && server.master)) {
+            /* In case we are using second connection and master is already set, 
+            * skip reviving the master from cache*/
+            replicationResurrectCachedMaster(conn);
+        }
+        replicationSteadyStateInit();
 
         /* If this instance was restarted and we read the metadata to
          * PSYNC from the persistence file, our replication backlog could
@@ -2547,6 +2753,13 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
             "but should be in the future: %s", reply);
         sdsfree(reply);
         return PSYNC_TRY_LATER;
+    }
+
+    if (!strncmp(reply, "$", 1) && server.second_conn_enabled) {
+        /* In case the main connection with master is at paync-only mode, the master will respond 
+         * with empty bulk to imply that psync is not possible */
+        serverLog(LL_NOTICE,"Master replyed with empty bulk");
+        return PSYNC_FULLRESYNC;
     }
 
     if (strncmp(reply,"-ERR",4)) {
@@ -2678,16 +2891,24 @@ void syncWithMaster(connection *conn) {
          * PSYNC2: supports PSYNC v2, so understands +CONTINUE <new repl ID>.
          *
          * The master will ignore capabilities it does not understand. */
-        err = sendCommand(conn,"REPLCONF",
-                "capa","eof","capa","psync2",NULL);
+        if (server.second_conn_enabled)
+            err = sendCommand(conn,"REPLCONF",
+                    "capa","eof","capa","psync2", "psync-only", "1", NULL);
+        // replace with psync2-only
+        // make sure master knows how to sync with offset
+        else
+            err = sendCommand(conn,"REPLCONF",
+                    "capa","eof","capa","psync2", NULL);
         if (err) goto write_error;
 
         server.repl_state = REPL_STATE_RECEIVE_AUTH_REPLY;
         return;
     }
 
-    if (server.repl_state == REPL_STATE_RECEIVE_AUTH_REPLY && !server.masterauth)
+    if (server.repl_state == REPL_STATE_RECEIVE_AUTH_REPLY && !server.masterauth) {
+        // TODO mitigation
         server.repl_state = REPL_STATE_RECEIVE_PORT_REPLY;
+    }
 
     /* Receive AUTH reply. */
     if (server.repl_state == REPL_STATE_RECEIVE_AUTH_REPLY) {
@@ -2765,10 +2986,23 @@ void syncWithMaster(connection *conn) {
         }
         server.repl_state = REPL_STATE_RECEIVE_PSYNC_REPLY;
         return;
+    } else if (server.repl_state == REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_SEND_PSYNC) {
+        if (slaveTryPartialResynchronization(conn,0) == PSYNC_WRITE_ERROR) {
+            err = sdsnew("Write error sending the PSYNC command.");
+            abortFailover("Write error to failover target");
+            // TODO mitigate
+            goto write_error;
+        }
+        server.repl_state = REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_PSYNC_REPLY;
+        return;
     }
 
-    /* If reached this point, we should be in REPL_STATE_RECEIVE_PSYNC_REPLY. */
-    if (server.repl_state != REPL_STATE_RECEIVE_PSYNC_REPLY) {
+    /* If reached this point, we should be in REPL_STATE_RECEIVE_PSYNC_REPLY or REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_PSYNC_REQ. */
+    if (server.second_conn_enabled && server.repl_state == REPL_STATE_CONNECTED) {
+        /* If we use second channel to load RDB, there is a race conditiin in which we already 
+         * done loading the RDB and thus the replica might already be connected */ 
+        serverLog(LL_NOTICE, "Second Channel: Trying psync after replica done loading the snapshot");
+    } else if (server.repl_state != REPL_STATE_RECEIVE_PSYNC_REPLY && server.repl_state != REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_PSYNC_REPLY) {
         serverLog(LL_WARNING,"syncWithMaster(): state machine error, "
                              "state should be RECEIVE_PSYNC but is %d",
                              server.repl_state);
@@ -2800,7 +3034,10 @@ void syncWithMaster(connection *conn) {
      * uninstalling the read handler from the file descriptor. */
 
     if (psync_result == PSYNC_CONTINUE) {
-        serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Master accepted a Partial Resynchronization.");
+        serverLog(LL_NOTICE,
+            "MASTER <-> REPLICA sync: %s", (server.repl_state == REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_PSYNC_REPLY)? 
+            "Master accept psync using main connection.":
+            "Master accepted a Partial Resynchronization.");
         if (server.supervised_mode == SUPERVISED_SYSTEMD) {
             redisCommunicateSystemd("STATUS=MASTER <-> REPLICA sync: Partial Resynchronization accepted. Ready to accept connections in read-write mode.\n");
         }
@@ -2836,8 +3073,28 @@ void syncWithMaster(connection *conn) {
         server.repl_transfer_fd = dfd;
     }
 
+    if (server.second_conn_enabled) {
+        /* Create a full sync connection */
+        server.repl_full_sync_s = connCreate(connTypeOfReplication());
+        if (connConnect(server.repl_full_sync_s, server.masterhost, server.masterport,
+                    server.bind_source_addr, fullSyncWithMaster) == C_ERR) {
+            serverLog(LL_WARNING,"Unable to connect to MASTER: %s",
+                    connGetLastError(server.repl_transfer_s));
+            connClose(server.repl_full_sync_s);
+            server.repl_full_sync_s = NULL;
+            return;
+        }
+        if (connSetReadHandler(conn, NULL) == C_ERR){
+            char conninfo[CONN_INFO_LEN];
+            serverLog(LL_WARNING,
+                "Can't clear main connection handler: %s (%s)",
+                strerror(errno), connGetInfo(conn, conninfo, sizeof(conninfo)));
+            goto error;
+        } 
+        return;
+    }
     /* Setup the non blocking download of the bulk file. */
-    if (connSetReadHandler(conn, readSyncBulkPayload)
+    else if (connSetReadHandler(conn, readSyncBulkPayload)
             == C_ERR)
     {
         char conninfo[CONN_INFO_LEN];
@@ -3347,7 +3604,11 @@ void replicationResurrectCachedMaster(connection *conn) {
     server.master->lastinteraction = server.unixtime;
     server.repl_state = REPL_STATE_CONNECTED;
     server.repl_down_since = 0;
+}
 
+/* Prepare replica to steady state.
+ * prerequisite: server.master is already initialized */
+void replicationSteadyStateInit(){
     /* Fire the master link modules event. */
     moduleFireServerEvent(REDISMODULE_EVENT_MASTER_LINK_CHANGE,
                           REDISMODULE_SUBEVENT_MASTER_LINK_UP,

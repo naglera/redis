@@ -168,6 +168,10 @@ typedef struct redisObject robj;
 #define STATS_METRIC_NET_OUTPUT_REPLICATION 4   /* Bytes written to network during replication. */
 #define STATS_METRIC_COUNT 5
 
+/* ENDOFFSET response constants */
+#define END_OFFSET_RESPONSE "+ENDOFFSET"
+#define END_OFFSET_RESPONSE_SIZE (sizeof(END_OFFSET_RESPONSE) + sizeof(int) + CONFIG_RUN_ID_SIZE+1 + sizeof(long long))
+
 /* Protocol and I/O related defines */
 #define PROTO_IOBUF_LEN         (1024*16)  /* Generic I/O buffer size */
 #define PROTO_REPLY_CHUNK_BYTES (16*1024) /* 16k output buffer */
@@ -389,6 +393,9 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
                                       memory eviction. */
 #define CLIENT_ALLOW_OOM (1ULL<<44) /* Client used by RM_Call is allowed to fully execute
                                        scripts even when in OOM */
+#define CLIENT_FSYNC_PSYNC_MODE (1ULL<<45) /* Replica syncs with two connections */
+
+#define CLIENT_PSYNC_CONN (1ULL<<46) /* Replica syncs with two connections */
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -438,6 +445,12 @@ typedef enum {
     /* --- End of handshake states --- */
     REPL_STATE_TRANSFER,        /* Receiving .rdb from master */
     REPL_STATE_CONNECTED,       /* Connected to master */
+    /* --- Second channel related states --- */
+    REPL_SEC_CONN_RECEIVE_CAPA_REPLY,       /* Wait for REPLCONF reply */
+    REPL_SEC_CONN_RECEIVE_RDBONLY_REPLY,    /* Wait for REPLCONF reply */
+    REPL_SEC_CONN_RECEIVE_OFFSET_REPLY,     /* Wait for REPLCONF reply */
+    REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_SEND_PSYNC, /* Same as REPL_STATE_SEND_PSYNC but during RDB load */
+    REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_PSYNC_REPLY,/* Same as REPL_STATE_RECEIVE_PSYNC_REPLY but during RDB load */
 } repl_state;
 
 /* The state of an in progress coordinated failover */
@@ -1777,6 +1790,8 @@ struct redisServer {
     int repl_min_slaves_max_lag;    /* Max lag of <count> slaves to write. */
     int repl_good_slaves_count;     /* Number of slaves with lag <= max_lag. */
     int repl_diskless_sync;         /* Master send RDB to slaves sockets directly. */
+    int second_conn_enabled;        /* True in case replica used second connection
+                                     * for full syncs*/
     int repl_diskless_load;         /* Slave parse RDB directly from the socket.
                                      * see REPL_DISKLESS_LOAD_* enum */
     int repl_diskless_sync_delay;   /* Delay to start a diskless repl BGSAVE. */
@@ -1799,6 +1814,7 @@ struct redisServer {
     off_t repl_transfer_read; /* Amount of RDB read from master during sync. */
     off_t repl_transfer_last_fsync_off; /* Offset when we fsync-ed last time. */
     connection *repl_transfer_s;     /* Slave -> Master SYNC connection */
+    connection *repl_full_sync_s;     /* Slave -> Master FULL SYNC connection */
     int repl_transfer_fd;    /* Slave -> Master SYNC temp file descriptor */
     char *repl_transfer_tmpfile; /* Slave-> master SYNC temp file name */
     time_t repl_transfer_lastio; /* Unix time of the latest read, for timeout */

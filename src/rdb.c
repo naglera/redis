@@ -3446,6 +3446,21 @@ void killRDBChild(void) {
      * - rdbRemoveTempFile */
 }
 
+int sendCurentOffsetToSlave(client* slave) {
+    char buf[128];
+    int buflen = 0;
+    memcpy(buf, "+ENDOFFSET", 10);
+    memcpy(buf + (buflen += 10), &server.db->id, sizeof(int));
+    memcpy(buf + (buflen += sizeof(int)), server.replid, CONFIG_RUN_ID_SIZE+1);
+    memcpy(buf + (buflen += CONFIG_RUN_ID_SIZE+1), &server.master_repl_offset, sizeof(long long)); 
+    buflen += sizeof(long long);
+    if (connWrite(slave->conn,buf,buflen) != buflen) {
+        freeClientAsync(slave);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
 /* Spawn an RDB child that writes the RDB to the sockets of the slaves
  * that are currently in SLAVE_STATE_WAIT_BGSAVE_START state. */
 int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
@@ -3492,6 +3507,9 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
                 continue;
             server.rdb_pipe_conns[server.rdb_pipe_numconns++] = slave->conn;
             replicationSetupSlaveForFullResync(slave,getPsyncInitialOffset());
+            if (slave->flags & CLIENT_FSYNC_PSYNC_MODE) {
+                sendCurentOffsetToSlave(slave);
+            }
         }
     }
 
