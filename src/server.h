@@ -449,6 +449,7 @@ typedef enum {
     REPL_SEC_CONN_RECEIVE_CAPA_REPLY,       /* Wait for REPLCONF reply */
     REPL_SEC_CONN_RECEIVE_RDBONLY_REPLY,    /* Wait for REPLCONF reply */
     REPL_SEC_CONN_RECEIVE_OFFSET_REPLY,     /* Wait for REPLCONF reply */
+    REPL_SEC_CONN_RECEIVE_ENDOFF,           /* Wait for $ENDOFF reply */
     REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_SEND_PSYNC, /* Same as REPL_STATE_SEND_PSYNC but during RDB load */
     REPL_SEC_CONN_RDB_LOAD_MAIN_CONN_PSYNC_REPLY,/* Same as REPL_STATE_RECEIVE_PSYNC_REPLY but during RDB load */
 } repl_state;

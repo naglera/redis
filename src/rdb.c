@@ -3448,12 +3448,11 @@ void killRDBChild(void) {
 
 int sendCurentOffsetToSlave(client* slave) {
     char buf[128];
-    int buflen = 0;
-    memcpy(buf, "+ENDOFFSET", 10);
-    memcpy(buf + (buflen += 10), &server.db->id, sizeof(int));
-    memcpy(buf + (buflen += sizeof(int)), server.replid, CONFIG_RUN_ID_SIZE+1);
-    memcpy(buf + (buflen += CONFIG_RUN_ID_SIZE+1), &server.master_repl_offset, sizeof(long long)); 
-    buflen += sizeof(long long);
+    int buflen;
+    /* Send to replica End Offset rsponse with structure
+     * $ENDOFF:<end-offset> <master-repl-id> <current-db-id> */
+    buflen = snprintf(buf,sizeof(buf),"$ENDOFF:%lld %s %d\t\n",server.master_repl_offset,server.replid,server.db->id);
+    serverLog(LL_NOTICE,"Sending end offset response to replica %s", replicationGetSlaveName(slave));
     if (connWrite(slave->conn,buf,buflen) != buflen) {
         freeClientAsync(slave);
         return C_ERR;
