@@ -2671,6 +2671,7 @@ void fullSyncWithMaster(connection* conn) {
 
 /* Initialize server.repl_data_buf infrastructure, we will allocate the buffer itself once we need it */
 void replDataBufInit() {
+    serverAssert(server.repl_data_buf.blocks == NULL);
     server.repl_data_buf.len = 0;
     server.repl_data_buf.blocks = listCreate();
     server.repl_data_buf.blocks->free = zfree;
@@ -3058,6 +3059,7 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
         /* In case the main connection with master is at psync-only mode, the master 
          * will respond with empty bulk to imply that psync is not possible */
         serverLog(LL_NOTICE, "PSYNC is not possible, initialize RDB channel");
+        sdsfree(reply);
         return PSYNC_FULLRESYNC;
     }
 
