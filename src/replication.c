@@ -2687,7 +2687,7 @@ void replStreamProgressCallback(long long offset, int readlen) {
     atomicIncr(server.stat_repl_processed_bytes, readlen);
 }
 
-/* Read replication data from primary into specefied repl buffer block */
+/* Reads replication data from primary into specified repl buffer block */
 int readIntoReplDataBlock(connection *conn, replDataBufBlock *o,  size_t read) {
     int nread = connRead(conn, o->buf + o->used, read);
     if (nread == -1) {
@@ -2708,17 +2708,15 @@ int readIntoReplDataBlock(connection *conn, replDataBufBlock *o,  size_t read) {
     }
     o->used += nread;
     incrReadsProcessed(nread);
-
     return read - nread;
 }
 
-int replicaBufferLimitReached() {
+int isReplicaBufferLimitReached() {
     return server.repl_data_buf.len > server.client_obuf_limits[1].hard_limit_bytes;
 }
 
-/* This handler Buffer incoming steady-state replication data while downloading and loading RDB.
- * The buffer will store the replication data until we finish loading the RDB, then we will stream
- * it into the db, and continue using sds type query buffer */
+/* This connection handler buffers incoming steady-state replication data while downloading and loading the
+ * RDB. As soon as the RDB is loaded, the data will be streamed into the database in streamReplDataBufToDb(). */
 void bufferReplData(connection *conn) {
     client *c = connGetPrivateData(conn);
     size_t readlen = PROTO_IOBUF_LEN;
@@ -2735,7 +2733,7 @@ void bufferReplData(connection *conn) {
             read = readIntoReplDataBlock(conn, tail, read);
         }
         if (readlen && read <= 0) {
-            if (replicaBufferLimitReached()) {
+            if (isReplicaBufferLimitReached()) {
                 serverLog(LL_DEBUG, "Replication buffer limit reached, stopping buffering");
                 break;
             }
@@ -2750,14 +2748,14 @@ void bufferReplData(connection *conn) {
             read = readIntoReplDataBlock(conn, tail, read);            
         }
         if (read > 0) {
-            /* Stop reading incase we read less than we anticipated */
+            /* Stop reading in case we read less than we anticipated */
             break;
         }
     }    
     c->lastinteraction = server.unixtime;  
 }
 
-/* Stream accumulated replication data into the database while freeing read nodes */
+/* Streams accumulated replication data into the database while freeing read nodes */
 void streamReplDataBufToDb(client *c) {
     serverAssert(c->flags & CLIENT_MASTER);
     blockingOperationStarts();
@@ -2771,7 +2769,6 @@ void streamReplDataBufToDb(client *c) {
         c->read_reploff += o->used;
         processInputBuffer(c);
         offset += o->used;
-
         replStreamProgressCallback(offset, o->used);
     } 
 

@@ -1726,7 +1726,7 @@ start_server {tags {"repl rdb-channel external:skip"}} {
             }
             
             $replica1 slaveof no one
-            
+
             $master set key3 val3
 
             test "Turn off repl-rdb-channel during sync" {
@@ -1751,7 +1751,7 @@ start_server {tags {"repl rdb-channel external:skip"}} {
                 set loglines [lindex $res 1]
                 incr $loglines 
             }
-            
+
             $replica1 slaveof no one
             $master set key4 val4            
             
