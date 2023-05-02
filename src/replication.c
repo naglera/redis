@@ -41,7 +41,6 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
 
 void replicationDiscardCachedMaster(void);
 void replicationResurrectMaster(connection *conn, client** master);
@@ -2495,10 +2494,10 @@ sds getReplicaPortString() {
 }
 
 void freeReplDataBuf() {
-    zmunmap(server.repl_data_buf->buf, server.repl_data_buf->size);
-    server.repl_data_buf->used = 0;
-    server.repl_data_buf->size = 0;
-    server.repl_data_buf->buf = NULL;
+    listEmpty(server.repl_data_buf->blocks);
+    server.repl_data_buf->blocks = NULL;
+    server.repl_data_buf->len = 0;
+    zfree(server.repl_data_buf);
     server.repl_data_buf = NULL;
 }
 
@@ -2671,33 +2670,21 @@ void fullSyncWithMaster(connection* conn) {
         goto error;
 }
 
-void resizeReplicationBuffer(long long new_size) {
-    server.repl_data_buf->buf = zmremap(server.repl_data_buf->buf, server.repl_data_buf->size, new_size, MREMAP_MAYMOVE);
-    server.repl_data_buf->size = new_size;
+void freeReplDataBlock(void *o) {
+    ((replDataBufBlock*)o)->used = 0;
+    ((replDataBufBlock*)o)->size = 0;
+    zfree(o);
 }
 
-void setReplicaBufferLimit() {
-    if (server.repl_data_buf && 
-        server.repl_data_buf->size > server.replica_full_sync_buffer_limit) {
-        /* Need to trim replication data buffer */
-        if (server.repl_data_buf->used > server.replica_full_sync_buffer_limit) {
-            /* Abort sync as the replica doesn't have enough space to store the replication buffer */
-            abortRdbConnectionSync(1);
-            return;
-        } else {
-            resizeReplicationBuffer(server.replica_full_sync_buffer_limit);
-        }
-    }
-}
-
-void replDataBufInit(connection *conn) {
-    client *c = connGetPrivateData(conn);
-    serverAssert(c->flags & CLIENT_MASTER);
-
+/* Initialize server.repl_data_buf infrastructure, we will allocate the buffer itself once we need it */
+void replDataBufInit() {
+    serverAssert(server.repl_data_buf == NULL);    
     server.repl_data_buf = zmalloc(sizeof(replDataBuf));
-    server.repl_data_buf->buf = zmmap(NULL, PROTO_IOBUF_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
-    server.repl_data_buf->size = PROTO_IOBUF_LEN;
-    server.repl_data_buf->used = 0;
+    server.repl_data_buf->len = 0;
+    server.repl_data_buf->blocks = listCreate();
+    void (*fn_ptr)(void*);
+    fn_ptr = &freeReplDataBlock;
+    server.repl_data_buf->blocks->free = fn_ptr;
 }
 
 /* Track replication data streaming progress, and serve clients from time to time */
@@ -2711,25 +2698,100 @@ void replStreamProgressCallback(long long offset, int readlen) {
     atomicIncr(server.stat_repl_processed_bytes, readlen);
 }
 
-/* Stream accumulated replication data into the database */
+/* Read replication data from primary into specefied repl buffer block */
+int readIntoReplDataBlock(connection *conn, replDataBufBlock *o,  size_t read) {
+    int nread = connRead(conn, o->buf + o->used, read);
+    if (nread == -1) {
+        if (connGetState(conn) != CONN_STATE_CONNECTED) {
+            serverLog(LL_VERBOSE, "Reading from primary: %s",connGetLastError(conn));
+            abortRdbConnectionSync(1);
+        }
+        return -1;
+    }
+    if (nread == 0) {
+        if (server.verbosity <= LL_VERBOSE) {
+            sds info = catClientInfoString(sdsempty(), connGetPrivateData(conn));
+            serverLog(LL_VERBOSE, "Client closed connection %s", info);
+            sdsfree(info);
+        }
+        abortRdbConnectionSync(1);
+        return -1;
+    }
+    o->used += nread;
+    incrReadsProcessed(nread);
+
+    return read - nread;
+}
+
+int replicaBufferLimitReached() {
+    return server.repl_data_buf->len > server.client_obuf_limits[1].hard_limit_bytes;
+}
+
+/* This handler Buffer incoming steady-state replication data while downloading and loading RDB.
+ * The buffer will store the replication data until we finish loading the RDB, then we will stream
+ * it into the db, and continue using sds type query buffer */
+void bufferReplData(connection *conn) {
+    serverAssert(server.repl_data_buf != NULL);
+    client *c = connGetPrivateData(conn);
+    size_t readlen = PROTO_IOBUF_LEN;
+    int read = 0;
+    
+    while (readlen > 0) {
+        listNode *ln = listLast(server.repl_data_buf->blocks);
+        replDataBufBlock *tail = ln ? listNodeValue(ln) : NULL;
+
+        /* Append to tail string when possible */
+        if (tail && tail->used < tail->size) {
+            size_t avail = tail->size - tail->used;
+            read = min(readlen, avail);
+            read = readIntoReplDataBlock(conn, tail, read);
+        }
+        if (readlen && read <= 0) {
+            if (replicaBufferLimitReached()) {
+                serverLog(LL_DEBUG, "Replication buffer limit reached, stopping buffering");
+                break;
+            }
+            /* Create a new node */
+            tail = zmalloc(sizeof(replDataBufBlock));
+            tail->size = PRIMARY_REPL_BUF_BLOCK_SIZE;
+            tail->used = 0;
+            listAddNodeTail(server.repl_data_buf->blocks, tail);
+            server.repl_data_buf->len += tail->size;
+
+            read = min(readlen, tail->size);
+            read = readIntoReplDataBlock(conn, tail, read);            
+        }
+        if (read > 0) {
+            /* Stop reading incase we read less than we anticipated */
+            break;
+        }
+    }    
+    c->lastinteraction = server.unixtime;  
+}
+
+/* Stream accumulated replication data into the database while freeing read nodes */
 void streamReplDataBufToDb(client *c) {
     serverAssert(c->flags & CLIENT_MASTER);
     blockingOperationStarts();
-    long long size, offset;
-    char* buf = server.repl_data_buf->buf;
-    size = server.repl_data_buf->used;
-    offset = 0;
-    while (size > 0) {
-        int readlen = min(size, PROTO_IOBUF_LEN);
-        c->querybuf = sdscatlen(c->querybuf, buf + offset, readlen);
-        c->read_reploff += readlen;
+    size_t offset;
+    listNode *cur = listFirst(server.repl_data_buf->blocks);
 
+    while (cur) {
+        /* Read and process repl data block */
+        replDataBufBlock *o = listNodeValue(cur);
+        c->querybuf = sdscatlen(c->querybuf, o->buf, o->used);
+        c->read_reploff += o->used;
         processInputBuffer(c);
-        size -= readlen;
-        offset += readlen;
+        offset += o->used;
 
-        replStreamProgressCallback(offset, readlen);
+        /* Free the link we read and move to the next block */
+        listNode *tmp = cur;
+        cur = listNextNode(cur);
+        listDelNode(server.repl_data_buf->blocks, tmp);
+
+        replStreamProgressCallback(offset, o->used);
     }
+    freeReplDataBuf();
     blockingOperationEnds();
 }
 
@@ -2745,7 +2807,7 @@ void updateReplicationStateActive(connection *conn) {
             /* RDB is still loading */
             server.repl_state = REPL_SEC_CONN_TWO_CONNECTIONS_ACTIVE;
             replicationSteadyStateInit(server.psync_master);
-            replDataBufInit(conn);
+            replDataBufInit();
             return;
         }
         if (server.repl_state == REPL_SEC_CONN_RECEIVE_PSYNC_REPLY && server.repl_full_sync_s == NULL) {
@@ -2765,7 +2827,6 @@ void updateReplicationStateActive(connection *conn) {
             connSetReadHandler(server.repl_transfer_s, NULL);
             streamReplDataBufToDb(server.psync_master);
             serverLog(LL_NOTICE, "Successfully streamed replication data into memory");
-            freeReplDataBuf();
             goto sync_success;
         }
         serverPanic("Unrecognized replication state %d using rdb connection", server.repl_state);
