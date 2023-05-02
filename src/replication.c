@@ -3259,7 +3259,7 @@ void syncWithMaster(connection *conn) {
             sdsfree(err);
             goto rdb_conn_error;
         }
-        sds_free(err);
+        sdsfree(err);
         server.repl_state = REPL_STATE_RECEIVE_CAPA_REPLY;
         return;
     }
