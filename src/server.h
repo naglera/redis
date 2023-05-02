@@ -970,6 +970,8 @@ typedef struct replBufBlock {
     char buf[];
 } replBufBlock;
 
+/* Link list block, used by replDataBuf during rdb-channel sync to store 
+ * replication data */
 typedef struct replDataBufBlock {
     size_t size, used;
     char buf[PRIMARY_REPL_BUF_BLOCK_SIZE];
@@ -1868,7 +1870,10 @@ struct redisServer {
     int repl_ping_slave_period;     /* Master pings the slave every N seconds */
     replBacklog *repl_backlog;      /* Replication backlog for partial syncs */
     long long repl_backlog_size;    /* Backlog circular buffer size */
-    replDataBuf *repl_data_buf;
+    struct {                        /* Replication data buffer for rdb-channel sync */
+        list *blocks;               /* list of replDataBufBlock */
+        size_t len;
+    } repl_data_buf;
     time_t repl_backlog_time_limit; /* Time without slaves after the backlog
                                        gets released. */
     time_t repl_no_slaves_since;    /* We have no slaves since that time.
