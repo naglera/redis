@@ -2817,7 +2817,6 @@ void replicationStartPendingFork(void);
 void replicationHandleMasterDisconnection(void);
 void replicationCacheMaster(client *c);
 void resizeReplicationBacklog();
-void setReplicaBufferLimit();
 void resizeReplicationBuffer(long long new_size);
 void replicationSetMaster(char *ip, int port);
 void replicationUnsetMaster(void);
@@ -2850,7 +2849,7 @@ void abortFailover(const char *err);
 const char *getFailoverStateString();
 int isReplicaPsyncChannel(client *c);
 int isReplicaRdbChannel(client *c);
-int isOngoingRdbChannelSync();
+int isOngoingRdbChannelSync(void);
 void abortRdbConnectionSync(int should_retry);
 void incrReadsProcessed(size_t nread);
 
