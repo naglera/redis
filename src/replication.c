@@ -2733,7 +2733,7 @@ void bufferReplData(connection *conn) {
             readlen -= read;
             read = readIntoReplDataBlock(conn, tail, read);
         }
-        if (readlen && read <= 0) {
+        if (readlen && read == 0) {
             if (isReplicaBufferLimitReached()) {
                 serverLog(LL_DEBUG, "Replication buffer limit reached, stopping buffering");
                 break;
@@ -2752,6 +2752,9 @@ void bufferReplData(connection *conn) {
         if (read > 0) {
             /* Stop reading in case we read less than we anticipated */
             break;
+        }
+        if (read == C_ERR) {
+            return;
         }
     }    
     c->lastinteraction = server.unixtime;  
