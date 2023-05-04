@@ -1874,7 +1874,7 @@ struct redisServer {
     struct {                        /* Replication data buffer for rdb-channel sync */
         list *blocks;               /* list of replDataBufBlock */
         size_t len;
-    } repl_data_buf;
+    } pending_repl_data;
     time_t repl_backlog_time_limit; /* Time without slaves after the backlog
                                        gets released. */
     time_t repl_no_slaves_since;    /* We have no slaves since that time.

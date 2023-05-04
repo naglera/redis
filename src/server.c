@@ -5697,7 +5697,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             freeMemoryGetNotCountedMemory(),
             mh->repl_backlog,
             server.repl_buffer_mem,
-            server.repl_data_buf.len,
+            server.pending_repl_data.len,
             mh->clients_slaves,
             mh->clients_normal,
             mh->cluster_links,
