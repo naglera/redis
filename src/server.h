@@ -138,7 +138,6 @@ struct hdr_histogram;
 #define CONFIG_BINDADDR_MAX 16
 #define CONFIG_MIN_RESERVED_FDS 32
 #define CONFIG_DEFAULT_PROC_TITLE_TEMPLATE "{title} {listen-addr} {server-mode}"
-#define PRIMARY_REPL_BUF_BLOCK_SIZE (1024*16) /* Primary replbuf block used while rdb-channel sync */
 
 /* Bucket sizes for client eviction pools. Each bucket stores clients with
  * memory usage of up to twice the size of the bucket below it. */
@@ -974,7 +973,7 @@ typedef struct replBufBlock {
  * replication data */
 typedef struct replDataBufBlock {
     size_t size, used;
-    char buf[PRIMARY_REPL_BUF_BLOCK_SIZE];
+    char buf[PROTO_IOBUF_LEN];
 } replDataBufBlock;
 
 /* Opaque type for the Slot to Key API. */

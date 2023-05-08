@@ -2740,7 +2740,7 @@ void bufferReplData(connection *conn) {
             }
             /* Create a new node */
             tail = zmalloc(sizeof(replDataBufBlock));
-            tail->size = PRIMARY_REPL_BUF_BLOCK_SIZE;
+            tail->size = PROTO_IOBUF_LEN;
             tail->used = 0;
             listAddNodeTail(server.pending_repl_data.blocks, tail);
             server.pending_repl_data.len += tail->size;
@@ -2767,7 +2767,7 @@ void streamReplDataBufToDb(client *c) {
     size_t offset = 0;
     listNode *cur = NULL;
 
-    while ((cur = listRemoveAndGetNext(server.pending_repl_data.blocks, cur))) {
+    while ((cur = listFirst(server.pending_repl_data.blocks))) {
         /* Read and process repl data block */
         replDataBufBlock *o = listNodeValue(cur);
         c->querybuf = sdscatlen(c->querybuf, o->buf, o->used);
@@ -2775,6 +2775,8 @@ void streamReplDataBufToDb(client *c) {
         processInputBuffer(c);
         offset += o->used;
         replStreamProgressCallback(offset, o->used);
+
+        listDelNode(server.pending_repl_data.blocks, cur);
     } 
 
     blockingOperationEnds();
